@@ -1,0 +1,5 @@
+numpy>=1.24
+# optional, only for tools/check_real.py (HF parity checks)
+# torch
+# transformers
+# tokenizers

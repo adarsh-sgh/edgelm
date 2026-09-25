@@ -1,0 +1,8 @@
+build*/
+.venv/
+models/
+testdata/
+out/
+*.elm
+*.json.trace
+__pycache__/
