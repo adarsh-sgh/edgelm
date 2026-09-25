@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest       # x86-64, gcc: scalar kernels
+            cxx: g++
+          - os: ubuntu-24.04-arm    # arm64, gcc: NEON + SDOT
+            cxx: g++
+          - os: macos-latest        # Apple silicon, clang: NEON + SDOT
+            cxx: clang++
+    runs-on: ${{ matrix.os }}
+    env:
+      CXX: ${{ matrix.cxx }}
+      EDGELM_TESTDATA: ${{ github.workspace }}/testdata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: tiny random-init model + NumPy goldens (through the real exporter)
+        run: |
+          pip install -r tools/requirements.txt
+          python tools/make_tiny.py --out testdata
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j 4
+      - name: tests
+        run: ./build/edgelm_tests
+      - name: cli smoke (run / bench / eval / info, profile trace)
+        run: |
+          ./build/edgelm info -m testdata/tiny.f32.elm --backend matmul-only,cpu
+          ./build/edgelm run -m testdata/tiny.q4.elm -p "the quick brown fox" -n 16 --threads 2 --ctx 128 --temp 0.8 --stats --profile trace.json
+          ./build/edgelm run -m testdata/tiny.f32.elm --dtype q8 --act int8 -p "the fox" -n 8 --ctx 128
+          ./build/edgelm bench -m testdata/tiny.q8.elm --threads 1,2 --prompt-len 32 --gen 16 --reps 2 --act int8
+          printf 'the quick brown fox jumps over the lazy dog. the dog sleeps in the sun.' > text.txt
+          ./build/edgelm eval -m testdata/tiny.q4.elm --ref testdata/tiny.f32.elm --text text.txt --window 16
+          python -c "import json; t=json.load(open('trace.json')); print(len(t['traceEvents']), 'trace events')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trace-${{ matrix.os }}
+          path: trace.json
+
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: asan-ubsan
+            flags: -DEDGELM_SANITIZE=ON
+          - name: tsan
+            flags: -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    env:
+      EDGELM_TESTDATA: ${{ github.workspace }}/testdata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r tools/requirements.txt && python tools/make_tiny.py --out testdata
+      - name: configure
+        run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.flags }}
+      - name: build
+        run: cmake --build build-san -j 4
+      - name: tests
+        run: ./build-san/edgelm_tests
+      - name: generate under sanitizers (4 threads, int8 activations)
+        run: ./build-san/edgelm run -m testdata/tiny.q8.elm --act int8 -p "the fox" -n 24 --threads 4 --ctx 64
+
+  android-ndk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cross-compile arm64-v8a (baseline armv8.0: NEON without SDOT fallback)
+        run: |
+          cmake -S . -B build-android -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28
+          cmake --build build-android -j 4
+          file build-android/edgelm build-android/edgelm_tests
+      - name: cross-compile arm64-v8a with dotprod (armv8.2-a+dotprod, e.g. Snapdragon 8-series)
+        run: |
+          cmake -S . -B build-android-dot -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DCMAKE_CXX_FLAGS=-march=armv8.2-a+dotprod
+          cmake --build build-android-dot -j 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edgelm-android-arm64-v8a
+          path: |
+            build-android/edgelm
+            build-android/edgelm_tests

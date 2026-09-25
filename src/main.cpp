@@ -181,7 +181,7 @@ int cmd_bench(const Args& a) {
   const bool json = a.has("json");
   const std::string backend = a.get("backend", "cpu");
   if (!json)
-    std::printf("%-5s %-10s %-4s %7s | %10s %9s | %10s | %9s %9s\n", "dtype", "backend", "simd", "threads",
+    std::printf("%-5s %-4s %-10s %-4s %7s | %10s %9s | %10s | %9s %9s\n", "dtype", "act", "backend", "simd", "threads",
                 "prefill/s", "TTFT ms", "decode/s", "arena MB", "peakRSS");
   for (int th : threads) {
     Args b = a;
@@ -212,16 +212,17 @@ int cmd_bench(const Args& a) {
       return v[v.size() / 2];
     };
     const char* simd = cpu::simd_enabled() ? "neon" : "off";
+    const char* act = o.act_quant && m.cfg.weight_dtype != DType::F32 ? "int8" : "f32";
     if (json)
-      std::printf("{\"dtype\":\"%s\",\"backend\":\"%s\",\"simd\":\"%s\",\"threads\":%d,\"prompt\":%d,\"gen\":%d,"
+      std::printf("{\"dtype\":\"%s\",\"act\":\"%s\",\"backend\":\"%s\",\"simd\":\"%s\",\"threads\":%d,\"prompt\":%d,\"gen\":%d,"
                   "\"prefill_tok_s\":%.2f,\"ttft_ms\":%.2f,\"decode_tok_s\":%.2f,\"weights_mb\":%.2f,\"arena_mb\":%.3f,"
                   "\"naive_mb\":%.3f,\"kv_mb\":%.2f,\"peak_rss_mb\":%.1f}\n",
-                  dtype_name(m.cfg.weight_dtype), backend.c_str(), simd, th, P, G, med(pre), med(ttft), med(dec),
+                  dtype_name(m.cfg.weight_dtype), act, backend.c_str(), simd, th, P, G, med(pre), med(ttft), med(dec),
                   m.weight_bytes() / 1e6, s.plan().arena_bytes / 1e6, s.plan().naive_bytes / 1e6, s.kv_bytes() / 1e6,
                   peak_rss_mb());
     else
-      std::printf("%-5s %-10s %-4s %7d | %10.1f %9.1f | %10.1f | %9.2f %8.0fM\n", dtype_name(m.cfg.weight_dtype),
-                  backend.c_str(), simd, th, med(pre), med(ttft), med(dec), s.plan().arena_bytes / 1e6, peak_rss_mb());
+      std::printf("%-5s %-4s %-10s %-4s %7d | %10.1f %9.1f | %10.1f | %9.2f %8.0fM\n", dtype_name(m.cfg.weight_dtype),
+                  act, backend.c_str(), simd, th, med(pre), med(ttft), med(dec), s.plan().arena_bytes / 1e6, peak_rss_mb());
     std::fflush(stdout);
   }
   return 0;
