@@ -204,24 +204,24 @@ def _pad(buf, align=ALIGN):
     buf.extend(b"\0" * ((-len(buf)) % align))
 
 
-def write_elm(path, cfg, builder, tok, dtype="f32", quant_embed=True):
-    """Serialize graph + tokenizer + weights. Linear weights (2-D) are quantized to `dtype`;
-    the tied embedding too unless quant_embed=False. Norm weights stay f32."""
+def write_elm(path, cfg, builder, tok, dtype="f32", embed_dtype=None):
+    """Serialize graph + tokenizer + weights. Linear weights (2-D) are quantized to `dtype`, the
+    (tied) embedding to `embed_dtype` (default: same as dtype). Norm weights stay f32."""
     toks, special, merges = tok
     blob = bytearray()
     records = []
     qdt = DTYPES[dtype]
+    edt = DTYPES[embed_dtype or dtype]
     for t in builder.tensors:
         rec = dict(t)
         rec.update(data_off=0, data_bytes=0, scale_off=0, scale_bytes=0, group=0)
         a = t["array"]
         if t["kind"] == KIND_WEIGHT:
-            is_embed = t["name"] == "model.embed_tokens.weight"
-            quant = a.ndim == 2 and qdt != DT_F32 and (quant_embed or not is_embed)
-            if quant and qdt == DT_Q8:
+            want = (edt if t["name"] == "model.embed_tokens.weight" else qdt) if a.ndim == 2 else DT_F32
+            if want == DT_Q8:
                 data, scale = quant_q8(a)
                 rec["dtype"], rec["group"] = DT_Q8, a.shape[1]
-            elif quant and qdt == DT_Q4:
+            elif want == DT_Q4:
                 data, scale = quant_q4(a)
                 rec["dtype"], rec["group"] = DT_Q4, Q4_GROUP
             else:

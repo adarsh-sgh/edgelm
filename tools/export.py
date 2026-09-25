@@ -68,13 +68,13 @@ def main():
     ap.add_argument("--hf-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--dtype", choices=["f32", "q8", "q4"], default="f32")
-    ap.add_argument("--f32-embed", action="store_true", help="keep the (tied) embedding in f32")
+    ap.add_argument("--embed-dtype", choices=["f32", "q8", "q4"], help="(tied) embedding dtype, default = --dtype")
     args = ap.parse_args()
     cfg, weights = load_hf(args.hf_dir)
     tok = elm.tokenizer_from_hf(os.path.join(args.hf_dir, "tokenizer.json"))
     b = elm.build_graph(cfg, weights)
-    n = elm.write_elm(args.out, cfg, b, tok, args.dtype, quant_embed=not args.f32_embed)
-    print(f"{args.out}: {args.dtype}, {len(b.tensors)} tensors, {len(b.ops)} ops, "
+    n = elm.write_elm(args.out, cfg, b, tok, args.dtype, args.embed_dtype)
+    print(f"{args.out}: {args.dtype} (embedding {args.embed_dtype or args.dtype}), {len(b.tensors)} tensors, {len(b.ops)} ops, "
           f"{len(tok[0])} vocab, {len(tok[2])} merges, {n / 1e6:.1f} MB")
 
 
