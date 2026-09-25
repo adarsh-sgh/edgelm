@@ -48,7 +48,8 @@ TEST_CASE("load-time quantization is bit-identical to the Python exporter's q8/q
       REQUIRE(a.dtype == b.dtype);
       REQUIRE(a.data_bytes == b.data_bytes);
       CHECK(std::memcmp(a.data, b.data, a.data_bytes) == 0);
-      CHECK(std::memcmp(a.scales, b.scales, a.scale_bytes) == 0);
+      REQUIRE(a.scale_bytes == b.scale_bytes);
+      if (a.scale_bytes) CHECK(std::memcmp(a.scales, b.scales, a.scale_bytes) == 0);
       n += a.dtype == dt;
     }
     CHECK(n == 1 + 2 * 7);  // tied embedding + 7 linears per layer
