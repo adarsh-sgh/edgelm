@@ -46,6 +46,12 @@ Session::Session(const Model& model, SessionOptions opt) : model_(model), opt_(s
   scratch_.assign(sf * pool_->size(), 0.f);
   for (int i = 0; i < pool_->size(); ++i) ctx_.scratch.push_back(scratch_.data() + i * sf);
   prof_.enabled = opt_.profile;
+  ctx_.act_quant = opt_.act_quant;
+  if (opt_.act_quant) {
+    act_q_.assign(static_cast<size_t>(opt_.max_batch) * max_k, 0);
+    act_scales_.assign(static_cast<size_t>(opt_.max_batch) * (max_k / kActBlock + 1), 0.f);
+    ctx_.aq = {act_q_.data(), act_scales_.data()};
+  }
 }
 
 const float* Session::forward(const int32_t* tokens, int n, const char* phase) {

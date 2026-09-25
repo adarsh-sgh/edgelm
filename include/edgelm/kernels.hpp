@@ -35,6 +35,18 @@ struct AttnArgs {
   const RopeTable* rope;  // non-null: apply RoPE to q and k inside the kernel
 };
 
+// Dynamic int8 activations (W8A8 / W4A8): each row of x is quantized on the fly in blocks of 32
+// (scale = amax/127, like GGML Q8_0) so q8/q4 matmuls run as int8 dot products (SDOT).
+constexpr int kActBlock = 32;
+struct ActBuf {
+  int8_t* q = nullptr;  // [T, K]
+  float* d = nullptr;   // [T, K/32]
+};
+void quantize_act_row(const float* x, int64_t k, int8_t* q, float* d);
+inline bool act_quant_applies(const Tensor& w) {
+  return (w.dtype == DType::Q8 || w.dtype == DType::Q4) && w.cols % kActBlock == 0;
+}
+
 struct MatmulTarget {
   const Tensor* w;
   float* y;                  // [T, w->rows]
@@ -44,13 +56,14 @@ struct MatmulTarget {
 namespace ref {
 void embed(const int32_t* tokens, int T, const Tensor& table, float* y);
 void rmsnorm(const float* x, const float* w, float* y, int rows, int dim, float eps);
-void matmul(const float* x, int T, const Tensor& w, float* y, const float* residual = nullptr);
+// act_quant: fake-quantize x the way the int8-activation kernels do, then f32 math.
+void matmul(const float* x, int T, const Tensor& w, float* y, const float* residual = nullptr, bool act_quant = false);
 void rope(const float* x, float* y, int T, int n_heads, int head_dim, int pos0, const RopeTable& rt);
 void attention(const AttnArgs& a);
 void add(const float* a, const float* b, float* y, int64_t n);
 void silu(const float* x, float* y, int64_t n);
 void mul(const float* a, const float* b, float* y, int64_t n);
-void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y);
+void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, bool act_quant = false);
 }  // namespace ref
 
 namespace cpu {
@@ -64,9 +77,12 @@ constexpr int kRowBlock = 16;  // output rows per task / per dequantized weight 
 size_t scratch_floats(int T, int64_t max_k, int max_ctx, int head_dim);
 
 void rmsnorm(const float* x, const float* w, float* y, int rows, int dim, float eps, ThreadPool* pool);
-// One parallel dispatch over the rows of every target (fused QKV = 3 targets).
-void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, ThreadPool* pool, float* const* scratch);
-void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, ThreadPool* pool, float* const* scratch);
+// One parallel dispatch over the rows of every target (fused QKV = 3 targets). With `aq`, q8/q4
+// targets use int8 activations (x quantized once into aq, shared by all targets).
+void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, ThreadPool* pool, float* const* scratch,
+            const ActBuf* aq = nullptr);
+void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, ThreadPool* pool, float* const* scratch,
+            const ActBuf* aq = nullptr);
 void rope(const float* x, float* y, int T, int n_heads, int head_dim, int pos0, const RopeTable& rt);
 void attention(const AttnArgs& a, ThreadPool* pool, float* const* scratch);
 void add(const float* a, const float* b, float* y, int64_t n);

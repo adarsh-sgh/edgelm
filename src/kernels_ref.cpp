@@ -1,4 +1,5 @@
 // Scalar reference kernels: serial, no blocking, dequantize-then-dot. The oracle for cpu::.
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -17,6 +18,22 @@ RopeTable::RopeTable(int head_dim, int max_pos_, float theta) : half(head_dim / 
       cos[static_cast<size_t>(p) * half + i] = static_cast<float>(std::cos(a));
       sin[static_cast<size_t>(p) * half + i] = static_cast<float>(std::sin(a));
     }
+}
+
+void quantize_act_row(const float* x, int64_t k, int8_t* q, float* d) {
+  for (int64_t b = 0; b < k / kActBlock; ++b) {
+    const float* xb = x + b * kActBlock;
+    float amax = 0.f;
+    for (int i = 0; i < kActBlock; ++i) amax = std::max(amax, std::fabs(xb[i]));
+    const float s = amax / 127.0f;
+    const float safe = s == 0.f ? 1.f : s;
+    d[b] = s;
+    for (int i = 0; i < kActBlock; ++i) {
+      const float v = xb[i] / safe;
+      const float r = std::copysign(std::floor(std::fabs(v) + 0.5f), v);
+      q[b * kActBlock + i] = static_cast<int8_t>(std::min(127.f, std::max(-127.f, r)));
+    }
+  }
 }
 
 namespace ref {
@@ -38,8 +55,19 @@ void rmsnorm(const float* x, const float* w, float* y, int rows, int dim, float 
   }
 }
 
-void matmul(const float* x, int T, const Tensor& w, float* y, const float* residual) {
+void matmul(const float* x, int T, const Tensor& w, float* y, const float* residual, bool act_quant) {
   const int64_t N = w.rows, K = w.cols;
+  std::vector<float> xf;
+  if (act_quant && act_quant_applies(w)) {
+    xf.resize(static_cast<size_t>(T) * K);
+    std::vector<int8_t> q(K);
+    std::vector<float> d(K / kActBlock);
+    for (int t = 0; t < T; ++t) {
+      quantize_act_row(x + t * K, K, q.data(), d.data());
+      for (int64_t i = 0; i < K; ++i) xf[t * K + i] = static_cast<float>(q[i]) * d[i / kActBlock];
+    }
+    x = xf.data();
+  }
   std::vector<float> row(K);
   for (int64_t n = 0; n < N; ++n) {
     dequantize_row(w, n, row.data());
@@ -122,11 +150,11 @@ void mul(const float* a, const float* b, float* y, int64_t n) {
   for (int64_t i = 0; i < n; ++i) y[i] = a[i] * b[i];
 }
 
-void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y) {
+void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, bool act_quant) {
   const int64_t n = static_cast<int64_t>(T) * wg.rows;
   std::vector<float> g(n), u(n);
-  matmul(x, T, wg, g.data());
-  matmul(x, T, wu, u.data());
+  matmul(x, T, wg, g.data(), nullptr, act_quant);
+  matmul(x, T, wu, u.data(), nullptr, act_quant);
   silu(g.data(), g.data(), n);
   mul(g.data(), u.data(), y, n);
 }

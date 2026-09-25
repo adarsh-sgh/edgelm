@@ -78,6 +78,8 @@ SessionOptions session_opts(const Args& a) {
   o.max_ctx = a.geti("ctx", 1024);
   o.max_batch = a.geti("batch", 128);
   o.fuse = !a.has("no-fuse");
+  o.act_quant = a.get("act", "f32") == "int8";
+  EDGELM_CHECK(a.get("act", "f32") == "f32" || a.get("act") == "int8", "--act must be f32|int8");
   o.profile = a.has("profile") || a.has("stats");
   if (a.has("no-simd")) cpu::set_simd(false);
   return o;

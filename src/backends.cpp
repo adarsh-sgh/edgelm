@@ -48,17 +48,21 @@ class ReferenceBackend : public Backend {
                      static_cast<int>(c.tensor(op.in[0]).cols), op.fattr[0]);
         break;
       case OpType::MATMUL:
-        ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.f(op.out[0]));
+        ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.f(op.out[0]), nullptr,
+                    c.act_quant);
         break;
       case OpType::MATMUL_N:
         for (size_t i = 0; i < op.out.size(); ++i)
-          ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1 + i]), c.f(op.out[i]));
+          ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1 + i]), c.f(op.out[i]), nullptr,
+                      c.act_quant);
         break;
       case OpType::MATMUL_ADD:
-        ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.f(op.out[0]), c.f(op.in[2]));
+        ref::matmul(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.f(op.out[0]), c.f(op.in[2]),
+                    c.act_quant);
         break;
       case OpType::FFN_SWIGLU:
-        ref::swiglu(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.tensor(op.in[2]), c.f(op.out[0]));
+        ref::swiglu(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.tensor(op.in[2]), c.f(op.out[0]),
+                    c.act_quant);
         break;
       case OpType::ROPE:
         ref::rope(c.f(op.in[0]), c.f(op.out[0]), static_cast<int>(c.rows(op.in[0])), op.iattr[0], op.iattr[1], c.pos0, *c.rope);
@@ -89,7 +93,7 @@ void run_cpu_matmuls(const Op& op, ExecContext& c, ThreadPool* pool) {
   } else {
     tg.push_back({&c.tensor(op.in[1]), c.f(op.out[0]), op.type == OpType::MATMUL_ADD ? c.f(op.in[2]) : nullptr});
   }
-  cpu::matmul(c.f(op.in[0]), T, tg, pool, c.scratch.data());
+  cpu::matmul(c.f(op.in[0]), T, tg, pool, c.scratch.data(), c.act_quant ? &c.aq : nullptr);
 }
 
 class CpuBackend : public Backend {
@@ -113,7 +117,7 @@ class CpuBackend : public Backend {
         break;
       case OpType::FFN_SWIGLU:
         cpu::swiglu(c.f(op.in[0]), static_cast<int>(c.rows(op.in[0])), c.tensor(op.in[1]), c.tensor(op.in[2]),
-                    c.f(op.out[0]), c.pool, c.scratch.data());
+                    c.f(op.out[0]), c.pool, c.scratch.data(), c.act_quant ? &c.aq : nullptr);
         break;
       case OpType::ROPE:
         cpu::rope(c.f(op.in[0]), c.f(op.out[0]), static_cast<int>(c.rows(op.in[0])), op.iattr[0], op.iattr[1], c.pos0, *c.rope);

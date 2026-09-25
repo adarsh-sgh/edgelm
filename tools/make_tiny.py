@@ -114,6 +114,8 @@ def main():
     for dt in ("f32", "q8", "q4"):
         c, Wd = elm.read_elm(os.path.join(args.out, f"tiny.{dt}.elm"))
         g[f"logits.{dt}"] = ref.forward(c, Wd, tokens)
+        if dt != "f32":
+            g[f"logits.{dt}a8"] = ref.forward(c, Wd, tokens, act_quant=True)
 
     # per-op goldens
     x = rng.normal(0, 1, (5, 64)).astype(np.float32)
@@ -130,6 +132,9 @@ def main():
     g["op.attn.y"] = ref.attention(q, k, v, 4, 2, 16, pos0=5)  # queries at positions 5, 6, 7
     gt, up = rng.normal(0, 2, (5, 128)).astype(np.float32), rng.normal(0, 1, (5, 128)).astype(np.float32)
     g["op.swiglu.g"], g["op.swiglu.u"], g["op.swiglu.y"] = gt, up, ref.silu(gt) * up
+    xa = rng.normal(0, 1, (3, 96)).astype(np.float32)
+    xa[1, 40] = 25.0  # outlier: its block gets a coarse scale, the others must not
+    g["op.actq.x"], g["op.actq.y"] = xa, ref.fake_quant_act(xa)
 
     texts = ["the quick brown fox", "  hello   world\n\nthe end ", "it's 2024, they're 12 dogs!",
              "fox\tforest  \n river's", ""]

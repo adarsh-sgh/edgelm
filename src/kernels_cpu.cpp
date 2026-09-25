@@ -107,6 +107,111 @@ inline float dot_row(const float* x, const Tensor& w, int64_t r) {
 }
 
 #if EDGELM_NEON
+inline int32x4_t sdot16(int32x4_t acc, int8x16_t a, int8x16_t b) {
+#if defined(__ARM_FEATURE_DOTPROD)
+  return vdotq_s32(acc, a, b);
+#else  // armv8.0 (e.g. baseline Android arm64-v8a): widen-multiply + pairwise accumulate
+  return vpadalq_s16(vpadalq_s16(acc, vmull_s8(vget_low_s8(a), vget_low_s8(b))), vmull_high_s8(a, b));
+#endif
+}
+#endif
+
+// out[t] = dot(dequant(xq_t), dequant(w_r)) for NT tokens (rows of xq/xd) against weight row r,
+// as int8 x int8 -> int32 per 32-block, scaled in f32. The weight block is loaded/unpacked once
+// and reused for all NT tokens.
+template <int NT>
+void dot_a8(const int8_t* xq, const float* xd, int64_t K, const Tensor& w, int64_t r, float* out) {
+  const int64_t nb = K / kActBlock;
+  if (w.dtype == DType::Q8) {
+    const int8_t* wr = static_cast<const int8_t*>(w.data) + r * K;
+#if EDGELM_NEON
+    if (use_neon()) {
+      float32x4_t acc[NT];
+      for (auto& a : acc) a = vdupq_n_f32(0);
+      for (int64_t b = 0; b < nb; ++b) {
+        const int8x16_t w0 = vld1q_s8(wr + b * 32), w1 = vld1q_s8(wr + b * 32 + 16);
+        for (int t = 0; t < NT; ++t) {
+          const int8_t* xb = xq + t * K + b * 32;
+          const int32x4_t s = sdot16(sdot16(vdupq_n_s32(0), w0, vld1q_s8(xb)), w1, vld1q_s8(xb + 16));
+          acc[t] = vfmaq_n_f32(acc[t], vcvtq_f32_s32(s), xd[t * nb + b]);
+        }
+      }
+      for (int t = 0; t < NT; ++t) out[t] = vaddvq_f32(acc[t]) * w.scales[r];
+      return;
+    }
+#endif
+    for (int t = 0; t < NT; ++t) {
+      float acc = 0.f;
+      for (int64_t b = 0; b < nb; ++b) {
+        int32_t s = 0;
+        for (int i = 0; i < 32; ++i) s += int32_t(wr[b * 32 + i]) * xq[t * K + b * 32 + i];
+        acc += static_cast<float>(s) * xd[t * nb + b];
+      }
+      out[t] = acc * w.scales[r];
+    }
+    return;
+  }
+  // Q4: group of 32 == activation block, combined scale ws[g] * xd[g]
+  const uint8_t* wr = static_cast<const uint8_t*>(w.data) + r * (K / 2);
+  const float* ws = w.scales + r * nb;
+#if EDGELM_NEON
+  if (use_neon()) {
+    float32x4_t acc[NT];
+    for (auto& a : acc) a = vdupq_n_f32(0);
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t eight = vdupq_n_s8(8);
+    for (int64_t g = 0; g < nb; ++g) {
+      const uint8x16_t bq = vld1q_u8(wr + g * 16);
+      const int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(bq, mask)), eight);
+      const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(bq, 4)), eight);
+      for (int t = 0; t < NT; ++t) {
+        const int8_t* xb = xq + t * K + g * 32;
+        const int32x4_t s = sdot16(sdot16(vdupq_n_s32(0), lo, vld1q_s8(xb)), hi, vld1q_s8(xb + 16));
+        acc[t] = vfmaq_n_f32(acc[t], vcvtq_f32_s32(s), ws[g] * xd[t * nb + g]);
+      }
+    }
+    for (int t = 0; t < NT; ++t) out[t] = vaddvq_f32(acc[t]);
+    return;
+  }
+#endif
+  for (int t = 0; t < NT; ++t) {
+    float acc = 0.f;
+    for (int64_t g = 0; g < nb; ++g) {
+      int32_t s = 0;
+      for (int i = 0; i < 16; ++i) {
+        const uint8_t b = wr[g * 16 + i];
+        s += (int32_t(b & 0x0F) - 8) * xq[t * K + g * 32 + i] + (int32_t(b >> 4) - 8) * xq[t * K + g * 32 + 16 + i];
+      }
+      acc += static_cast<float>(s) * (ws[g] * xd[t * nb + g]);
+    }
+    out[t] = acc;
+  }
+}
+
+// out[t * ldo] for all T tokens against weight row r (4 tokens at a time).
+void row_a8(const ActBuf& aq, int T, const Tensor& w, int64_t r, float* out, int64_t ldo) {
+  const int64_t K = w.cols, nb = K / kActBlock;
+  float v[4];
+  int t = 0;
+  for (; t + 4 <= T; t += 4) {
+    dot_a8<4>(aq.q + t * K, aq.d + t * nb, K, w, r, v);
+    for (int i = 0; i < 4; ++i) out[(t + i) * ldo] = v[i];
+  }
+  for (; t < T; ++t) {
+    dot_a8<1>(aq.q + t * K, aq.d + t * nb, K, w, r, v);
+    out[t * ldo] = v[0];
+  }
+}
+
+void quantize_rows(const float* x, int T, int64_t K, const ActBuf& aq, ThreadPool* pool) {
+  auto body = [&](int64_t b, int64_t e, int) {
+    for (int64_t t = b; t < e; ++t) quantize_act_row(x + t * K, K, aq.q + t * K, aq.d + t * (K / kActBlock));
+  };
+  if (pool && T > 8) pool->parallel_for(T, 4, body);
+  else body(0, T, 0);
+}
+
+#if EDGELM_NEON
 // y[i][j] = dot(x_i, w_j) for a 4x4 tile; 16 accumulators + 8 operand registers.
 inline void tile4x4(const float* x, int64_t ldx, const float* w, int64_t ldw, int64_t K, float out[4][4]) {
   float32x4_t c[4][4];
@@ -215,7 +320,12 @@ void rmsnorm(const float* x, const float* w, float* y, int rows, int dim, float 
   else body(0, rows, 0);
 }
 
-void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, ThreadPool* pool, float* const* scratch) {
+void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, ThreadPool* pool, float* const* scratch,
+            const ActBuf* aq) {
+  bool a8 = false;
+  if (aq)
+    for (const MatmulTarget& tg : targets) a8 |= act_quant_applies(*tg.w);
+  if (a8) quantize_rows(x, T, targets[0].w->cols, *aq, pool);
   struct Block {
     int target;
     int64_t r0;
@@ -231,7 +341,13 @@ void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, Thr
       const MatmulTarget& tg = targets[blk.target];
       const Tensor& w = *tg.w;
       const int64_t N = w.rows;
-      if (T == 1) {
+      if (a8 && act_quant_applies(w)) {
+        for (int64_t r = blk.r0; r < blk.r0 + blk.nr; ++r) {
+          row_a8(*aq, T, w, r, tg.y + r, N);
+          if (tg.residual)
+            for (int t = 0; t < T; ++t) tg.y[t * N + r] += tg.residual[t * N + r];
+        }
+      } else if (T == 1) {
         for (int64_t r = blk.r0; r < blk.r0 + blk.nr; ++r)
           tg.y[r] = (tg.residual ? tg.residual[r] : 0.f) + dot_row(x, w, r);
       } else {
@@ -244,8 +360,11 @@ void matmul(const float* x, int T, const std::vector<MatmulTarget>& targets, Thr
   else body(0, static_cast<int64_t>(blocks.size()), 0);
 }
 
-void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, ThreadPool* pool, float* const* scratch) {
+void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y, ThreadPool* pool, float* const* scratch,
+            const ActBuf* aq) {
   const int64_t N = wg.rows, K = wg.cols;
+  const bool a8 = aq && act_quant_applies(wg) && act_quant_applies(wu);
+  if (a8) quantize_rows(x, T, K, *aq, pool);
   const int64_t nblocks = (N + kRowBlock - 1) / kRowBlock;
   auto body = [&](int64_t b, int64_t e, int tid) {
     float* deq = scratch[tid];
@@ -254,12 +373,18 @@ void swiglu(const float* x, int T, const Tensor& wg, const Tensor& wu, float* y,
     for (int64_t bi = b; bi < e; ++bi) {
       const int64_t r0 = bi * kRowBlock;
       const int nr = static_cast<int>(std::min<int64_t>(kRowBlock, N - r0));
-      if (T == 1) {
+      if (a8) {  // G/U hold one column per row of the block: [T, kRowBlock]
+        for (int j = 0; j < nr; ++j) {
+          row_a8(*aq, T, wg, r0 + j, G + j, kRowBlock);
+          row_a8(*aq, T, wu, r0 + j, U + j, kRowBlock);
+        }
+      } else if (T == 1) {
         for (int64_t r = r0; r < r0 + nr; ++r) y[r] = silu1(dot_row(x, wg, r)) * dot_row(x, wu, r);
         continue;
+      } else {
+        gemm_f32(x, T, weight_tile(wg, r0, nr, deq), nr, K, G, kRowBlock, nullptr);
+        gemm_f32(x, T, weight_tile(wu, r0, nr, deq), nr, K, U, kRowBlock, nullptr);
       }
-      gemm_f32(x, T, weight_tile(wg, r0, nr, deq), nr, K, G, kRowBlock, nullptr);
-      gemm_f32(x, T, weight_tile(wu, r0, nr, deq), nr, K, U, kRowBlock, nullptr);
       for (int t = 0; t < T; ++t)
         for (int j = 0; j < nr; ++j)
           y[t * N + r0 + j] = silu1(G[t * kRowBlock + j]) * U[t * kRowBlock + j];

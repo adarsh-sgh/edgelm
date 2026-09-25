@@ -42,6 +42,7 @@ TEST_CASE("fp32/q8/q4 logits match the NumPy reference (quantized vs its own deq
       std::vector<std::string> backends;
       int threads, batch, prefill;
       bool fuse;
+      bool act_quant = false;
     };
     const Variant vs[] = {
         {"cpu fused 4t full prefill", {"cpu"}, 4, 128, S, true},
@@ -51,6 +52,9 @@ TEST_CASE("fp32/q8/q4 logits match the NumPy reference (quantized vs its own deq
         {"chunked prefill (batch 7)", {"cpu"}, 2, 7, S, true},
         {"prefill 5 then decode 35", {"cpu"}, 4, 128, 5, true},
         {"decode only", {"cpu"}, 2, 128, 0, true},
+        {"int8 activations, cpu", {"cpu"}, 4, 128, 9, true, true},
+        {"int8 activations, reference", {"reference"}, 1, 128, S, true, true},
+        {"int8 activations, matmul-only", {"matmul-only", "cpu"}, 2, 6, S, true, true},
     };
     for (const Variant& v : vs) {
       CAPTURE(dt);
@@ -60,9 +64,12 @@ TEST_CASE("fp32/q8/q4 logits match the NumPy reference (quantized vs its own deq
       o.threads = v.threads;
       o.max_batch = v.batch;
       o.fuse = v.fuse;
+      o.act_quant = v.act_quant;
       auto got = run_all_logits(m, o, ids, v.prefill);
-      REQUIRE(got.size() == want.f.size());
-      CHECK(rel_err(got.data(), want.f.data(), got.size()) < 2e-5);
+      // f32 weights ignore act_quant; quantized ones compare against the NumPy W8A8/W4A8 reference
+      const GArray& w = v.act_quant && std::string(dt) != "f32" ? G(std::string("logits.") + dt + "a8") : want;
+      REQUIRE(got.size() == w.f.size());
+      CHECK(rel_err(got.data(), w.f.data(), got.size()) < 2e-5);
     }
   }
 }

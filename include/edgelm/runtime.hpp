@@ -22,6 +22,7 @@ struct SessionOptions {
   bool all_logits = false;  // logits for every position (eval) instead of the last one
   bool fuse = true;
   bool profile = false;
+  bool act_quant = false;   // W8A8 / W4A8: int8 activations for q8/q4 matmuls (no effect on f32 weights)
 };
 
 class Session {
@@ -57,7 +58,8 @@ class Session {
   std::vector<Partition> parts_;
   std::unique_ptr<ThreadPool> pool_;
   std::unique_ptr<uint8_t[]> arena_raw_;
-  std::vector<float> kcache_, vcache_, scratch_;
+  std::vector<float> kcache_, vcache_, scratch_, act_scales_;
+  std::vector<int8_t> act_q_;
   RopeTable rope_;
   ExecContext ctx_;
   Profiler prof_;

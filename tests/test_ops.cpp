@@ -188,3 +188,54 @@ TEST_CASE("quantization error is bounded and fused multi-target matmul equals se
     CHECK(rel_err(yc.data(), rc.data(), yc.size()) < 1e-5);
   }
 }
+
+TEST_CASE("int8 activations (W8A8/W4A8): quantizer matches NumPy bit-exactly, SDOT kernels match reference") {
+  const GArray &xa = G("op.actq.x"), &ya = G("op.actq.y");  // (compared by value: numpy keeps -0.0)
+  std::vector<int8_t> q(96);
+  std::vector<float> d(3), deq(96);
+  for (int t = 0; t < 3; ++t) {
+    quantize_act_row(xa.f.data() + t * 96, 96, q.data(), d.data());
+    for (int i = 0; i < 96; ++i) deq[i] = static_cast<float>(q[i]) * d[i / 32];
+    for (int i = 0; i < 96; ++i) {
+      CAPTURE(t);
+      CAPTURE(i);
+      CHECK(deq[i] == ya.f[t * 96 + i]);
+    }
+  }
+  quantize_act_row(xa.f.data() + 96, 96, q.data(), d.data());
+  CHECK(d[1] >= 25.f / 127.f);  // the outlier's block (row 1, block 1) gets a coarse scale ...
+  CHECK(d[0] < 0.1f);           // ... its neighbours do not
+
+  for (DType dt : {DType::Q8, DType::Q4}) {
+    const int64_t n = 70, k = 160;
+    auto W = make_weight(randn(n * k, 21), n, k, dt);
+    auto Wu = make_weight(randn(n * k, 22), n, k, dt);
+    for (int T : {1, 3, 4, 9}) {
+      CAPTURE(dtype_name(dt));
+      CAPTURE(T);
+      Pool p(T, k);
+      std::vector<int8_t> aq_q(T * k);
+      std::vector<float> aq_d(T * k / 32);
+      ActBuf aq{aq_q.data(), aq_d.data()};
+      auto x = randn(T * k, 30 + T);
+      auto res = randn(T * n, 40 + T);
+      std::vector<float> want(T * n), got(T * n), f32path(T * n);
+      ref::matmul(x.data(), T, W->t, want.data(), res.data(), /*act_quant=*/true);
+      ref::matmul(x.data(), T, W->t, f32path.data(), res.data(), false);
+      for (bool simd : {true, false}) {
+        cpu::set_simd(simd);
+        cpu::matmul(x.data(), T, {{&W->t, got.data(), res.data()}}, &p.pool, p.ptrs.data(), &aq);
+        CHECK(rel_err(got.data(), want.data(), got.size()) < 1e-5);
+        std::vector<float> sw_want(T * n), sw_got(T * n);
+        ref::swiglu(x.data(), T, W->t, Wu->t, sw_want.data(), true);
+        cpu::swiglu(x.data(), T, W->t, Wu->t, sw_got.data(), &p.pool, p.ptrs.data(), &aq);
+        CHECK(rel_err(sw_got.data(), sw_want.data(), sw_got.size()) < 1e-5);
+      }
+      cpu::set_simd(true);
+      // activation rounding is visible but small next to the f32-activation result
+      const double e = rel_err(want.data(), f32path.data(), want.size());
+      CHECK(e > 0);
+      CHECK(e < 2e-2);
+    }
+  }
+}

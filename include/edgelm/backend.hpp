@@ -20,6 +20,8 @@ struct ExecContext {
   const RopeTable* rope = nullptr;
   ThreadPool* pool = nullptr;
   std::vector<float*> scratch;  // per thread
+  bool act_quant = false;       // int8 activations for q8/q4 matmuls
+  ActBuf aq;
   const Tensor& tensor(int i) const { return graph->tensors[i]; }
   float* f(int i) const { return ptr[i]; }
   int64_t rows(int i) const;

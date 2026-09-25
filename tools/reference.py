@@ -57,24 +57,39 @@ def silu(x):
     return (x / (f32(1.0) + np.exp(-x))).astype(f32)
 
 
-def forward(cfg, W, tokens):
-    """Full-sequence forward, returns logits for every position: [S, vocab]."""
+def fake_quant_act(x, block=32):
+    """Dynamic int8 activation quantization as the C++ W8A8 kernels do it (per row, blocks of 32,
+    scale = amax/127, round half away from zero in float32), returned dequantized."""
+    t, k = x.shape
+    b = x.astype(f32).reshape(t, k // block, block)
+    s = (np.abs(b).max(axis=2) / f32(127.0)).astype(f32)
+    safe = np.where(s == 0, f32(1.0), s).astype(f32)
+    v = (b / safe[..., None]).astype(f32)
+    q = np.clip(np.sign(v) * np.floor(np.abs(v) + f32(0.5)), -127, 127).astype(f32)
+    return (q * s[..., None]).reshape(t, k).astype(f32)
+
+
+def forward(cfg, W, tokens, act_quant=False):
+    """Full-sequence forward, returns logits for every position: [S, vocab].
+    act_quant: int8 activations into every linear layer (W8A8 / W4A8 semantics)."""
     nh, nkv, hd, eps, theta = cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"], cfg["norm_eps"], cfg["rope_theta"]
     emb = W["model.embed_tokens.weight"]
+    aq = fake_quant_act if act_quant else (lambda a: a)
     x = emb[np.asarray(tokens)].astype(f32)
     for l in range(cfg["n_layers"]):
         p = f"model.layers.{l}."
         h = rmsnorm(x, W[p + "input_layernorm.weight"], eps)
+        h = aq(h)
         q = h @ W[p + "self_attn.q_proj.weight"].T
         k = h @ W[p + "self_attn.k_proj.weight"].T
         v = h @ W[p + "self_attn.v_proj.weight"].T
         q, k = rope(q, 0, nh, hd, theta), rope(k, 0, nkv, hd, theta)
         a = attention(q, k, v, nh, nkv, hd)
-        x = x + a @ W[p + "self_attn.o_proj.weight"].T
-        h2 = rmsnorm(x, W[p + "post_attention_layernorm.weight"], eps)
+        x = x + aq(a) @ W[p + "self_attn.o_proj.weight"].T
+        h2 = aq(rmsnorm(x, W[p + "post_attention_layernorm.weight"], eps))
         m = silu(h2 @ W[p + "mlp.gate_proj.weight"].T) * (h2 @ W[p + "mlp.up_proj.weight"].T)
-        x = (x + m @ W[p + "mlp.down_proj.weight"].T).astype(f32)
-    x = rmsnorm(x, W["model.norm.weight"], eps)
+        x = (x + aq(m) @ W[p + "mlp.down_proj.weight"].T).astype(f32)
+    x = aq(rmsnorm(x, W["model.norm.weight"], eps))
     head = emb if cfg["tied"] else W["lm_head.weight"]
     return (x @ head.T).astype(f32)
 

@@ -21,11 +21,11 @@ TEXT = ("The capital of France is Paris, and the capital of Germany is Berlin. I
         "transcontinental railroad was completed; it's 3,000 km long.")
 
 
-def edgelm_logits(binary, model, ids, prefill, threads, backend="cpu"):
+def edgelm_logits(binary, model, ids, prefill, threads, backend="cpu", act="f32"):
     with tempfile.NamedTemporaryFile(suffix=".f32", delete=False) as f:
         out = f.name
     subprocess.run([binary, "logits", "-m", model, "--tokens", ",".join(map(str, ids)), "--prefill", str(prefill),
-                    "--threads", str(threads), "--backend", backend, "--out", out], check=True, capture_output=True)
+                    "--threads", str(threads), "--backend", backend, "--act", act, "--out", out], check=True, capture_output=True)
     a = np.fromfile(out, dtype=np.float32)
     os.unlink(out)
     return a.reshape(len(ids), -1)
@@ -83,6 +83,10 @@ def main():
         print(tag)
         report("numpy ref vs edgelm prefill", edgelm_logits(args.binary, path, ids, len(ids), 4), want)
         report("numpy ref vs edgelm prefill 8 + decode", edgelm_logits(args.binary, path, ids, 8, 4), want)
+        if cfg["dtype"] != elm.DT_F32:
+            want_a8 = ref.forward(cfg, W, ids, act_quant=True)
+            report("numpy ref vs edgelm, int8 activations", edgelm_logits(args.binary, path, ids, 8, 4, act="int8"),
+                   want_a8)
         if hf_logits is not None:
             if cfg["dtype"] == elm.DT_F32:
                 report("HF transformers vs numpy ref", want, hf_logits)
