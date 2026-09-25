@@ -1,6 +1,8 @@
 // Tokenizer vs goldens from tools/make_tiny.py (Python BPE over the same merges), plus the
 // GPT-2 pre-tokenizer rules. The real SmolLM2 tokenizer is checked against HF `tokenizers` by
 // tools/check_real.py.
+#include <algorithm>
+
 #include "common.hpp"
 #include "edgelm/tokenizer.hpp"
 
