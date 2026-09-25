@@ -257,6 +257,14 @@ size_t Model::weight_bytes() const {
   return n;
 }
 
+void Model::prefault() const {
+  if (!file_) return;
+  ::madvise(const_cast<uint8_t*>(file_->data()), file_->size(), MADV_WILLNEED);
+  volatile uint8_t sink = 0;
+  for (size_t off = 0; off < file_->size(); off += 4096) sink = sink + file_->data()[off];
+  (void)sink;
+}
+
 size_t Model::file_bytes() const { return file_ ? file_->size() : 0; }
 
 }  // namespace edgelm

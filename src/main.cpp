@@ -131,7 +131,10 @@ void finish_profile(const Args& a, Session& s) {
 }
 
 int cmd_run(const Args& a) {
+  const int64_t tl = Profiler::now_ns();
   Model m = load_model(a);
+  if (!a.has("no-prefault")) m.prefault();
+  const double load_ms = ms_since(tl);
   Tokenizer tok(m.tok);
   SessionOptions o = session_opts(a);
   Session s(m, o);
@@ -159,8 +162,9 @@ int cmd_run(const Args& a) {
     next = sampler.sample(logits, m.cfg.vocab);
   }
   const double dec_ms = ms_since(t1);
-  std::printf("\n\n[%s, %d threads] prompt %zu tok, TTFT %.1f ms (prefill %.1f tok/s), decode %d tok %.1f tok/s, peak RSS %.0f MB\n",
-              dtype_name(m.cfg.weight_dtype), o.threads, prompt.size(), ttft, prompt.size() / (ttft / 1e3), generated,
+  std::printf("\n\n[%s%s, %d threads] load %.0f ms, prompt %zu tok, TTFT %.1f ms (prefill %.1f tok/s), decode %d tok %.1f tok/s, peak RSS %.0f MB\n",
+              dtype_name(m.cfg.weight_dtype), o.act_quant ? "+a8" : "", o.threads, load_ms, prompt.size(), ttft,
+              prompt.size() / (ttft / 1e3), generated,
               generated > 1 ? (generated - 1) / (dec_ms / 1e3) : 0.0, peak_rss_mb());
   finish_profile(a, s);
   return 0;
@@ -211,7 +215,7 @@ int cmd_bench(const Args& a) {
       std::sort(v.begin(), v.end());
       return v[v.size() / 2];
     };
-    const char* simd = cpu::simd_enabled() ? "neon" : "off";
+    const char* simd = backend == "reference" ? "-" : cpu::simd_enabled() ? "neon" : "off";
     const char* act = o.act_quant && m.cfg.weight_dtype != DType::F32 ? "int8" : "f32";
     if (json)
       std::printf("{\"dtype\":\"%s\",\"act\":\"%s\",\"backend\":\"%s\",\"simd\":\"%s\",\"threads\":%d,\"prompt\":%d,\"gen\":%d,"
@@ -252,13 +256,15 @@ int cmd_eval(const Args& a) {
   Session sc(cand, o);
   std::unique_ptr<Session> sr = with_ref ? std::make_unique<Session>(refm, o) : nullptr;
   const int V = cand.cfg.vocab;
-  double nll_c = 0, nll_r = 0, cos_sum = 0, cos_min = 1;
+  // Softmax ignores a constant shift of the logits (q4 can move all of them by several units), so
+  // the cosine is taken on mean-centred logits; KL(ref || cand) is reported alongside.
+  double nll_c = 0, nll_r = 0, cos_sum = 0, cos_min = 1, kl_sum = 0;
   size_t n = 0, agree = 0;
-  auto nll = [&](const float* lg, int target) {
+  auto lse = [&](const float* lg) {
     const float mx = *std::max_element(lg, lg + V);
     double s = 0;
     for (int i = 0; i < V; ++i) s += std::exp(static_cast<double>(lg[i] - mx));
-    return std::log(s) + mx - lg[target];
+    return std::log(s) + mx;
   };
   const int64_t t0 = Profiler::now_ns();
   for (size_t w0 = 0; w0 + 1 < ids.size(); w0 += W) {
@@ -273,30 +279,45 @@ int cmd_eval(const Args& a) {
     }
     for (int i = 0; i + 1 < len; ++i) {
       const float* rc = lc + static_cast<size_t>(i) * V;
-      nll_c += nll(rc, ids[w0 + i + 1]);
+      const int target = ids[w0 + i + 1];
+      const double lse_c = lse(rc);
+      nll_c += lse_c - rc[target];
       if (lr) {
         const float* rr = lr + static_cast<size_t>(i) * V;
-        nll_r += nll(rr, ids[w0 + i + 1]);
+        const double lse_r = lse(rr);
+        nll_r += lse_r - rr[target];
         agree += argmax(rc, V) == argmax(rr, V);
-        double d = 0, na = 0, nb = 0;
+        double mc = 0, mr = 0;
         for (int v = 0; v < V; ++v) {
-          d += double(rc[v]) * rr[v];
-          na += double(rc[v]) * rc[v];
-          nb += double(rr[v]) * rr[v];
+          mc += rc[v];
+          mr += rr[v];
+        }
+        mc /= V;
+        mr /= V;
+        double d = 0, na = 0, nb = 0, kl = 0;
+        for (int v = 0; v < V; ++v) {
+          const double a = rc[v] - mc, b = rr[v] - mr;
+          d += a * b;
+          na += a * a;
+          nb += b * b;
+          const double lpr = rr[v] - lse_r, lpc = rc[v] - lse_c;
+          kl += std::exp(lpr) * (lpr - lpc);
         }
         const double c = d / std::sqrt(na * nb);
         cos_sum += c;
         cos_min = std::min(cos_min, c);
+        kl_sum += kl;
       }
       ++n;
     }
   }
   std::printf("eval: %zu tokens in windows of %d, %.1f s\n", n, W, ms_since(t0) / 1e3);
-  std::printf("  %s: perplexity %.4f\n", dtype_name(cand.cfg.weight_dtype), std::exp(nll_c / n));
+  std::printf("  %s%s: perplexity %.4f\n", dtype_name(cand.cfg.weight_dtype), o.act_quant ? " (int8 act)" : "",
+              std::exp(nll_c / n));
   if (sr) {
     std::printf("  ref %s: perplexity %.4f\n", dtype_name(refm.cfg.weight_dtype), std::exp(nll_r / n));
-    std::printf("  top-1 agreement %.2f%% (%zu/%zu), logits cosine mean %.6f min %.6f\n", 100.0 * agree / n, agree, n,
-                cos_sum / n, cos_min);
+    std::printf("  top-1 agreement %.2f%% (%zu/%zu), centred-logit cosine mean %.5f min %.5f, KL(ref||cand) %.5f nats\n",
+                100.0 * agree / n, agree, n, cos_sum / n, cos_min, kl_sum / n);
   }
   std::printf("  weights %.1f MB\n", cand.weight_bytes() / 1e6);
   return 0;

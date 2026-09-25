@@ -33,6 +33,8 @@ class Model {
   // Load-time quantization of every f32 2-D weight (same rounding as tools/elm.py).
   void convert_weights(DType target);
 
+  // Touch every page of the mapping so the first prefill does not pay the page faults.
+  void prefault() const;
   size_t weight_bytes() const;  // bytes of all weight data + scales
   size_t file_bytes() const;
 

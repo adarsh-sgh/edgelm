@@ -27,10 +27,19 @@ std::atomic<bool> g_simd{true};
 
 inline bool use_neon() { return EDGELM_NEON && g_simd.load(std::memory_order_relaxed); }
 
+// 4 independent accumulators, like the NEON path, so the scalar baseline is not latency-bound on
+// one FMA chain (the compiler may not reassociate float sums into SIMD without -ffast-math).
 float dot_f32_scalar(const float* a, const float* b, int64_t k) {
-  float s = 0.f;
-  for (int64_t i = 0; i < k; ++i) s += a[i] * b[i];
-  return s;
+  float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  int64_t i = 0;
+  for (; i + 4 <= k; i += 4) {
+    s0 += a[i] * b[i];
+    s1 += a[i + 1] * b[i + 1];
+    s2 += a[i + 2] * b[i + 2];
+    s3 += a[i + 3] * b[i + 3];
+  }
+  for (; i < k; ++i) s0 += a[i] * b[i];
+  return (s0 + s1) + (s2 + s3);
 }
 
 float dot_q8(const float* x, const int8_t* w, int64_t k) {  // unscaled
@@ -50,8 +59,15 @@ float dot_q8(const float* x, const int8_t* w, int64_t k) {  // unscaled
     s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
   }
 #endif
+  float s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  for (; i + 4 <= k; i += 4) {
+    s += x[i] * static_cast<float>(w[i]);
+    s1 += x[i + 1] * static_cast<float>(w[i + 1]);
+    s2 += x[i + 2] * static_cast<float>(w[i + 2]);
+    s3 += x[i + 3] * static_cast<float>(w[i + 3]);
+  }
   for (; i < k; ++i) s += x[i] * static_cast<float>(w[i]);
-  return s;
+  return (s + s1) + (s2 + s3);
 }
 
 float dot_q4(const float* x, const uint8_t* w, const float* scales, int64_t k) {  // scaled
@@ -84,13 +100,13 @@ float dot_q4(const float* x, const uint8_t* w, const float* scales, int64_t k) {
   }
 #endif
   for (; g < groups; ++g) {
-    float gs = 0.f;
+    float g0 = 0.f, g1 = 0.f;
     for (int i = 0; i < 16; ++i) {
       const uint8_t b = w[g * 16 + i];
-      gs += x[g * 32 + i] * static_cast<float>(static_cast<int>(b & 0x0F) - 8);
-      gs += x[g * 32 + 16 + i] * static_cast<float>(static_cast<int>(b >> 4) - 8);
+      g0 += x[g * 32 + i] * static_cast<float>(static_cast<int>(b & 0x0F) - 8);
+      g1 += x[g * 32 + 16 + i] * static_cast<float>(static_cast<int>(b >> 4) - 8);
     }
-    s += gs * scales[g];
+    s += (g0 + g1) * scales[g];
   }
   return s;
 }
