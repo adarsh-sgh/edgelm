@@ -168,10 +168,16 @@ void quantize_q4(const float* w, int64_t n, int64_t k, uint8_t* out, float* scal
   for (int64_t r = 0; r < n; ++r) {
     for (int64_t g = 0; g < k / G; ++g) {
       const float* x = w + r * k + g * G;
-      float m = 0.f;
-      for (int i = 0; i < G; ++i)  // first element of max magnitude, like numpy argmax
-        if (std::fabs(x[i]) > std::fabs(m)) m = x[i];
-      const float d = m / -8.0f;
+      int best = 0;  // first element of max magnitude, like numpy argmax
+      float amax = std::fabs(x[0]);
+      for (int i = 1; i < G; ++i) {
+        const float a = std::fabs(x[i]);
+        if (a > amax) {
+          amax = a;
+          best = i;
+        }
+      }
+      const float d = x[best] / -8.0f;
       const float safe = d == 0.f ? 1.f : d;
       scales[r * (k / G) + g] = d;
       uint8_t* o = out + r * (k / 2) + g * (G / 2);
